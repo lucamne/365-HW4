@@ -1,8 +1,8 @@
 """Get information about a FAT32 filesystem and each file."""
-
 import json
 import os
 import sys
+import math
 from typing import Optional
 
 import hw4utils
@@ -40,7 +40,6 @@ class Fat:
             total_sectors
             sectors_per_fat
             root_dir_first_cluster
-            total_sectors
             bytes_per_cluster
             fat0_sector_start
             fat0_sector_end
@@ -51,6 +50,43 @@ class Fat:
 
         Refer to Carrier Chapters 9 and 10.
         """
+        boot_sector = self.file.read(512)
+
+        bytes_per_sector = unpack(boot_sector[11:13])
+        sectors_per_cluster = unpack(boot_sector[13:14])
+        reserved_sectors = unpack(boot_sector[14:16])
+        number_of_fats = unpack(boot_sector[16:17])
+
+        total_sectors = unpack(boot_sector[19:21])
+        if total_sectors == 0:
+            total_sectors = unpack(boot_sector[32:36])
+
+        sectors_per_fat = unpack(boot_sector[36:40])
+        root_dir_first_cluster = unpack(boot_sector[44:48])
+        bytes_per_cluster = bytes_per_sector * sectors_per_cluster
+        fat0_sector_start = reserved_sectors
+        fat0_sector_end = fat0_sector_start + sectors_per_fat - 1
+        data_start = fat0_sector_start + sectors_per_fat * number_of_fats
+        data_end = total_sectors - 1
+
+        self.boot = {
+            "bytes_per_sector": bytes_per_sector,
+            "sectors_per_cluster": sectors_per_cluster,
+            "reserved_sectors": reserved_sectors,
+            "number_of_fats": number_of_fats,
+            "total_sectors": total_sectors,
+            "sectors_per_fat": sectors_per_fat,
+            "root_dir_first_cluster": root_dir_first_cluster,
+            "bytes_per_cluster": bytes_per_cluster,
+            "fat0_sector_start": fat0_sector_start,
+            "fat0_sector_end": fat0_sector_end,
+            "data_start": data_start,
+            "data_end": data_end,
+        }
+
+        self.file.seek(fat0_sector_start * bytes_per_sector)
+        fat0 = self.file.read((fat0_sector_end - fat0_sector_start) * bytes_per_sector)
+        self.fat = fat0
 
     def info(self):
         """Print already-parsed information about the FAT filesystem as a json string"""
@@ -64,25 +100,13 @@ class Fat:
             print(json.dumps(file))
 
     def _to_sector(self, cluster: int) -> int:
-        """Convert a cluster number to a sector number
 
-        Carrier explains how in Chapter 10.
-
-        returns:
-            int: sector number
-        """
-        pass
+        return (cluster - 2) * self.boot["sectors_per_cluster"] + self.boot[
+            "data_start"
+        ]
 
     def _end_sector(self, cluster: int) -> int:
-        """Return the last sector of a cluster
-
-        There are n sectors per cluster. This functions returns
-        the last sector of the cluster.
-
-        returns:
-            int: sector number
-        """
-        pass
+        return self._to_sector(cluster) + self.boot["sectors_per_cluster"]
 
     def _get_sectors(self, number: int) -> list[int]:
         """Return list of sectors for a given table entry number
@@ -97,11 +121,28 @@ class Fat:
         returns:
             list[int]: list of sectors
         """
+
+        sectors = []
+        current_cluster = number
+        fat_entry = self._get_fat_entry(current_cluster)
+        while fat_entry != 0:
+            starting_sector = self._to_sector(current_cluster)
+            for i in range(self.boot["sectors_per_cluster"]):
+                sectors.append(starting_sector + i)
+            if fat_entry > 0x0FFFFFF8:
+                break
+            current_cluster = fat_entry
+            fat_entry = self._get_fat_entry(current_cluster)
+
         assert (
             0 < (number * 4 + 4) < self.boot["sectors_per_fat"]
         ), f"{number} exceeds FAT size"
 
-        pass
+        return sectors
+
+    def _get_fat_entry(self, cluster: int) -> int:
+        """Given a cluster, returns the value of the corresponding entry in fat."""
+        return unpack(self.fat[cluster * 4 : (cluster * 4) + 4])
 
     def _retrieve_data(self, cluster: int, ignore_unallocated=False) -> bytes:
         """Read in the data for a given file allocation table entry number (i.e., the cluster number).
@@ -126,7 +167,21 @@ class Fat:
         returns:
             bytes: data (possibly zero length)
         """
-        pass
+        fat_entry = self._get_fat_entry(cluster)
+        if ignore_unallocated and fat_entry == 0:
+            sectors = [self._to_sector(cluster)]
+        else:
+            sectors = self._get_sectors(cluster)
+
+        byte_sequence = b""
+
+        bytes_per_sector = self.boot["bytes_per_sector"]
+
+        for sector in sectors:
+            self.file.seek(sector * bytes_per_sector)
+            byte_sequence += self.file.read(bytes_per_sector)
+
+        return byte_sequence
 
     def _get_first_cluster(self, entry: bytes) -> int:
         """Returns the first cluster of the content of a given directory entry
@@ -168,7 +223,14 @@ class Fat:
             str (or None if unallocated cluster): slack content (up to 32 bytes)
 
         """
-        pass
+        cluster_data = self._retrieve_data(cluster, True)
+        content = str(cluster_data[0 : min(128, filesize)])
+        if self._get_fat_entry(cluster) == 0:
+            slack = None
+        else:
+            slack = str(cluster_data[filesize : min(filesize + 32, len(cluster_data))])
+
+        return (content, slack)
 
     def parse_dir(self, cluster: int, parent="") -> list[dict]:
         """Parse a directory cluster, returns a list of dictionaries, one dict per entry.
@@ -201,7 +263,66 @@ class Fat:
         returns:
             list[dict]: list of dictionaries, one dict per entry
         """
-        pass
+        dict_list = []
+
+        count = 0
+        starting_byte = 0
+
+        dir_data = self._retrieve_data(cluster)
+
+        while len(dir_data) - starting_byte >= 32:
+
+            directory_attribute = unpack(
+                dir_data[starting_byte + 11 : starting_byte + 12]
+            )
+
+            allocation_byte = unpack(dir_data[starting_byte : starting_byte + 1])
+            is_deleted = False
+
+            if allocation_byte == 0 or allocation_byte == 0xE5:
+                is_deleted = True
+
+            entry_type = hw4utils.get_entry_type(directory_attribute)
+
+            entry_dict = {
+                "parent": parent,
+                "dir_cluster": cluster,
+                "entry_num": count,
+                "dir_sectors": self._get_sectors(cluster),
+                "entry_type": entry_type,
+                "name": hw4utils.parse_name(
+                    dir_data[starting_byte : starting_byte + 32]
+                ),
+                "deleted": is_deleted,
+            }
+
+            content_cluster_bytes = (
+                dir_data[starting_byte + 26 : starting_byte + 28]
+                + dir_data[starting_byte + 20 : starting_byte + 22]
+            )
+            content_cluster = unpack(content_cluster_bytes)
+            if entry_type == "dir" and count >= 2:
+
+                entry_dict["content_cluster"] = content_cluster
+                # if count >= 2:
+                dict_list += self.parse_dir(
+                    content_cluster, parent + "/" + entry_dict["name"]
+                )
+
+            if entry_type not in ["vol", "lfn", "dir"]:
+                entry_dict["content_cluster"] = content_cluster
+                filesize = unpack(dir_data[starting_byte + 28 : starting_byte + 32])
+                entry_dict["filesize"] = filesize
+                entry_dict["content_sectors"] = self._get_sectors(content_cluster)
+                entry_dict["content"], entry_dict["slack"] = self._get_content(
+                    content_cluster, filesize
+                )
+            dict_list.append(entry_dict)
+
+            count += 1
+            starting_byte += 32
+
+        return dict_list
 
 
 def main():
