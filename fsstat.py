@@ -2,7 +2,6 @@
 import json
 import os
 import sys
-import math
 from typing import Optional
 
 import hw4utils
@@ -18,7 +17,8 @@ class Fat:
         """Parses a FAT32 filesystem"""
         self.filename = filename
         self.file = open(self.filename, "rb")
-        # set of key/value pairs parsed from the "Reserved" sector of the filesystem
+        # set of key/value pairs parsed from the "Reserved"
+        # sector of the filesystem
         self.boot = dict()
         self._parse_reserved_sector()
 
@@ -85,7 +85,8 @@ class Fat:
         }
 
         self.file.seek(fat0_sector_start * bytes_per_sector)
-        fat0 = self.file.read((fat0_sector_end - fat0_sector_start) * bytes_per_sector)
+        fat0_sector_size = fat0_sector_end - fat0_sector_start
+        fat0 = self.file.read((fat0_sector_size) * bytes_per_sector)
         self.fat = fat0
 
     def info(self):
@@ -100,13 +101,14 @@ class Fat:
             print(json.dumps(file))
 
     def _to_sector(self, cluster: int) -> int:
-
+        """Given a cluster, returns the corresponding sector in data."""
         return (cluster - 2) * self.boot["sectors_per_cluster"] + self.boot[
             "data_start"
         ]
 
     def _end_sector(self, cluster: int) -> int:
-        return self._to_sector(cluster) + self.boot["sectors_per_cluster"]
+        """Given a cluster, returns the last sector of the cluster."""
+        return self._to_sector(cluster) + self.boot["sectors_per_cluster"] - 1
 
     def _get_sectors(self, number: int) -> list[int]:
         """Return list of sectors for a given table entry number
@@ -125,12 +127,18 @@ class Fat:
         sectors = []
         current_cluster = number
         fat_entry = self._get_fat_entry(current_cluster)
+
         while fat_entry != 0:
             starting_sector = self._to_sector(current_cluster)
+            # Starting with the starting_sector, consecutive sectors are
+            # appended to the sector list based on how many sectors
+            # are in a cluster
             for i in range(self.boot["sectors_per_cluster"]):
                 sectors.append(starting_sector + i)
+
             if fat_entry > 0x0FFFFFF8:
                 break
+
             current_cluster = fat_entry
             fat_entry = self._get_fat_entry(current_cluster)
 
@@ -142,10 +150,12 @@ class Fat:
 
     def _get_fat_entry(self, cluster: int) -> int:
         """Given a cluster, returns the value of the corresponding entry in fat."""
+        # Each entry in fat is 4 bytes
         return unpack(self.fat[cluster * 4 : (cluster * 4) + 4])
 
     def _retrieve_data(self, cluster: int, ignore_unallocated=False) -> bytes:
-        """Read in the data for a given file allocation table entry number (i.e., the cluster number).
+        """Read in the data for a given file allocation table entry number
+        (i.e., the cluster number).
 
         Important: this function returns all bytes in the cluster, even the slack data past the
         actual filesize.
@@ -167,6 +177,7 @@ class Fat:
         returns:
             bytes: data (possibly zero length)
         """
+
         fat_entry = self._get_fat_entry(cluster)
         if ignore_unallocated and fat_entry == 0:
             sectors = [self._to_sector(cluster)]
@@ -264,10 +275,8 @@ class Fat:
             list[dict]: list of dictionaries, one dict per entry
         """
         dict_list = []
-
         count = 0
         starting_byte = 0
-
         dir_data = self._retrieve_data(cluster)
 
         while len(dir_data) - starting_byte >= 32:
@@ -275,14 +284,17 @@ class Fat:
             directory_attribute = unpack(
                 dir_data[starting_byte + 11 : starting_byte + 12]
             )
+            content_cluster_bytes = (
+                dir_data[starting_byte + 26 : starting_byte + 28]
+                + dir_data[starting_byte + 20 : starting_byte + 22]
+            )
+            content_cluster = unpack(content_cluster_bytes)
+            entry_type = hw4utils.get_entry_type(directory_attribute)
 
             allocation_byte = unpack(dir_data[starting_byte : starting_byte + 1])
             is_deleted = False
-
             if allocation_byte == 0 or allocation_byte == 0xE5:
                 is_deleted = True
-
-            entry_type = hw4utils.get_entry_type(directory_attribute)
 
             entry_dict = {
                 "parent": parent,
@@ -296,23 +308,16 @@ class Fat:
                 "deleted": is_deleted,
             }
 
-            content_cluster_bytes = (
-                dir_data[starting_byte + 26 : starting_byte + 28]
-                + dir_data[starting_byte + 20 : starting_byte + 22]
-            )
-            content_cluster = unpack(content_cluster_bytes)
             if entry_type == "dir" and count >= 2:
-
                 entry_dict["content_cluster"] = content_cluster
-                # if count >= 2:
                 dict_list += self.parse_dir(
                     content_cluster, parent + "/" + entry_dict["name"]
                 )
 
             if entry_type not in ["vol", "lfn", "dir"]:
-                entry_dict["content_cluster"] = content_cluster
                 filesize = unpack(dir_data[starting_byte + 28 : starting_byte + 32])
                 entry_dict["filesize"] = filesize
+                entry_dict["content_cluster"] = content_cluster
                 entry_dict["content_sectors"] = self._get_sectors(content_cluster)
                 entry_dict["content"], entry_dict["slack"] = self._get_content(
                     content_cluster, filesize

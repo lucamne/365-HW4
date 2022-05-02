@@ -12,7 +12,14 @@ FILENAME = "fsstat.py"
 class TestFormatting(unittest.TestCase):
     @weight(5)
     def test_part0_black(self):
-        p = run(["black", "--quiet", "--check", FILENAME])
+        p = run(
+            [
+                "black",
+                "--check",
+                "--quiet",
+                FILENAME,
+            ]
+        )
         self.assertEqual(
             p.returncode, 0, f"Black return code of {p.returncode} indicates a problem."
         )
